@@ -1,64 +1,101 @@
 import cv2
+import glob
+import os
 import numpy as np
+from PIL import Image
 import open3d as o3d
+import matplotlib.pyplot as plt
 
-img1 = cv2.imread("Image1.jpg")
-img2 = cv2.imread("Image2.jpg")
+from BackGround_Removal import remove_background
+from Feature_Extraction import get_features, match_features, estimate_pose
+from Depth_Estimation import get_depth_map
 
-#Gri Tona Cevir analiz kolay olsun
-gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) 
-gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+INPUT_DIR = 'Input_Images'
+OUTPUT_DIR = 'Output_Models'
 
-#ORB la 5000 belirgin nokta bul 
-orb = cv2.ORB_create(5000)
-kp1, des1 = orb.detectAndCompute(gray1,None)#(kp= anahtar noktalar, des= tanımlayıcılar)
-kp2, des2 = orb.detectAndCompute(gray2,None)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-#BFMatcher: iki resmin ortak noktalarını karşılaştır
-bf= cv2.BFMatcher(cv2.NORM_HAMMING,crossCheck=True)
-matches = bf.match(des1,des2)
-matches = sorted(matches,key = lambda x: x.distance) #3 En iyi eşleşmeleri başa al
+image_paths = glob.glob(f"{INPUT_DIR}/*.jpg")
+total_images = len(image_paths)
+focal_length = 1200
+K = np.array([[focal_length, 0, 640],[0, focal_length, 360],[0, 0, 1]], dtype=np.float64)
+global_points_3D = [];
+dense_global_points_3D = []
 
-#Eşleşen noktaların (x,y) kordinatlarını listelere al 
-pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
-pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+prev_R = np.eye(3)
+prev_t = np.zeros((3, 1))
+current_R = np.eye(3)
+current_t = np.zeros((3, 1))
 
-#F = fundemental matrix (iki görüntü arasındaki geometrik ilişkiyi kurar)
-#RANSAC = Hatalı eşleşmeleri temizlemek için kullanılır
-F,mask = cv2.findFundamentalMat(pts1,pts2,cv2.FM_RANSAC)
-
-#Sadece Doğru(maskelenmiş noktlaarı tut)
-pts1=pts1[mask.ravel()==1]
-pts2=pts2[mask.ravel()==1]
+# if total_images < 25:
+#     print("Uyarı: 25'ten az görsel bulundu. Daha fazla görsel ekleyerek daha iyi sonuçlar elde edebilirsiniz.")
 
 
-#K = Kamera Matrisi (kameranın odak uzaklığını ve merkez noktasını içerir)
-h,w =gray1.shape
-focal_length = 0.8 * w #Yaklaşık odak uzaklığı
-K=np.array([[focal_length, 0, w/2],
-            [0, focal_length, h/2],
-            [0, 0, 1]])
+# else:
+#     print("Görseller yeterli sayıda bulundu. İşlem başlatılıyor...")
+    
+print(f"Toplam {total_images} görsel bulundu. İşleniyor...")
+img_prev = cv2.imread(image_paths[0])
+img_prev_nobg = remove_background(img_prev)
+img_prev_gray = cv2.cvtColor(remove_background(img_prev), cv2.COLOR_BGRA2GRAY)
+kp_prev, des_prev = get_features(img_prev_gray)
 
-#Essential Matix(E) kameranın dış parametrelerini(rotasyon ve çeviri)
-E = K.T @ F @ K
+depth_map_prev = get_depth_map(img_prev_nobg)
+h,w = depth_map_prev.shape
+intrinsic = o3d.camera.PinholeCameraIntrinsic(w, h, focal_length, focal_length, w/2, h/2)
+depth_o3d_prev = o3d.geometry.Image(depth_map_prev.astype(np.float32))
+pcd_prev = o3d.geometry.PointCloud.create_from_depth_image(depth_o3d_prev, intrinsic)
+dense_global_points_3D.append(np.asarray(pcd_prev.points))
 
-#recoverPose: kameranın ne kadar döndüğünü(R) ve ne kadar kaydığını (t) hesaplar
-_, R, t, mask = cv2.recoverPose(E, pts1, pts2, K)
+for i in range(1, len(image_paths)):
 
-#projeksiyon matrisleri:Kameranın dünya kordinatlarını belirler
-proj1 = K @ np.hstack((np.eye(3), np.zeros((3,1)))) #İlk kamera başlangıç noktasında
-proj2 = K @ np.hstack((R, t)) #İkinci kamera R ve t kadar uzakta
+    img_curr = cv2.imread(image_paths[i])
+    img_curr_nobg = remove_background(img_curr)
+    img_curr_gray = cv2.cvtColor(img_curr_nobg, cv2.COLOR_BGRA2GRAY)
 
-#TriangulatePoints: 2D noktaları çakıştırarak 4D homojen koordinatlar üretir
-points_4d = cv2.triangulatePoints(proj1, proj2, pts1.T, pts2.T)
-#Homojen koordinatları 3D koordinatlara çevir
-points_3d = points_4d [:3]/ points_4d[3] 
+    kp_curr, des_curr = get_features(img_curr_gray)
+    matches = match_features(des_prev, des_curr)
 
-#Open3D ile 3D noktaları görselleştir
-points = points_3d.T
+    if len(matches) > 10:
+        R,t,pts1,pts2,mask = estimate_pose(kp_prev, kp_curr, matches, K)
+        current_t = current_t + current_R @ t
+        current_R = R @ current_R
 
-pcd = o3d.geometry.PointCloud()#Boş bir nokta bulutu objesi oluştur
-pcd.points = o3d.utility.Vector3dVector(points) #Hesaplanan noktaları içine yükle
+        Proj1 = K @ np.hstack((prev_R, prev_t))
+        Proj2 = K @ np.hstack((current_R, current_t))
 
-o3d.visualization.draw_geometries([pcd]) #Nokta bulutunu görselleştir
+        points_4D = cv2.triangulatePoints(Proj1, Proj2, pts1.T, pts2.T)
+        points_3D = points_4D / points_4D[3, :]
+        global_points_3D.append(points_3D[:3, :].T)
+
+        depth_map = get_depth_map(img_curr_nobg)
+        depth_o3d = o3d.geometry.Image(depth_map.astype(np.float32))
+
+        pcd_local = o3d.geometry.PointCloud.create_from_depth_image(depth_o3d, intrinsic)
+        local_points = np.asarray(pcd_local.points)
+
+        if len(local_points) > 0:
+            # Yerel noktaları mevcut kamera açısına göre Global Kordinata taşı
+            global_dense = (current_R @ local_points.T).T + current_t.T
+            dense_global_points_3D.append(global_dense)
+
+
+    kp_prev, des_prev = kp_curr, des_curr
+    prev_R = current_R.copy()
+    prev_t = current_t.copy()
+
+else:
+        print(f"ERROR: {os.path.basename(image_paths[i])} Image doesn't resemble the previous .")
+
+if len(dense_global_points_3D) > 0:
+
+    all_dense_points = np.vstack(dense_global_points_3D)
+
+    final_pcd = o3d.geometry.PointCloud()
+    final_pcd.points = o3d.utility.Vector3dVector(all_dense_points)
+    
+    output_cloud_path = f"{OUTPUT_DIR}/dense_cloud.ply"
+    o3d.io.write_point_cloud(output_cloud_path, final_pcd)
+    print(f"Dense Sparse Cloud Saved: {output_cloud_path} ({len(all_dense_points)} nokta)")
+
 
