@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 def get_features(image_gray):
-    sift = cv2.SIFT_create()
+    sift = cv2.SIFT_create(nfeatures=10000, contrastThreshold=0.02, edgeThreshold=15)
     keypoints, descriptors = sift.detectAndCompute(image_gray, None)
     return keypoints, descriptors
 
@@ -12,7 +12,7 @@ def match_features(descriptors1, descriptors2):
 
     good_matches = []
     for m, n in matches:
-        if m.distance < 0.75 * n.distance:
+        if m.distance < 0.60 * n.distance:
             good_matches.append(m)
     return good_matches
 
